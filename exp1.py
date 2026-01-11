@@ -4,6 +4,8 @@
 import argparse
 import time
 import math
+import os
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -39,7 +41,10 @@ class NoneCompressor(Compressor):
 
 
 class Int8SymPerTensor(Compressor):
-    """Naive baseline: symmetric per-tensor int8."""
+    """
+    Naive baseline: symmetric per-tensor int8.
+    TODO: Not verified!
+    """
     name = "int8_sym_tensor"
     def compress(self, x: torch.Tensor) -> Payload:
         maxv = x.abs().amax()
@@ -166,7 +171,10 @@ def make_hook(pipeline: Pipeline, key: str):
         else:
             return out
 
-        ntokens = int(hs.shape[0] * hs.shape[1]) if hs.dim() >= 2 else 0
+        if hs.dim() >= 2:
+            ntokens = int(hs.shape[0] * hs.shape[1])
+        else:
+            raise ValueError(f"Unrecognized hidden state of shape {hs.shape}, will lead to wrong token count.")
         return pack(pipeline.run(hs, key=key, ntokens=ntokens))
     return _hook
 
@@ -306,6 +314,7 @@ def load_model(model_name: str, dtype_str: str, load_in_8bit: bool, load_in_4bit
 # =========================
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--exp_dir", type=str, default="exp_data", help="Folder to write experiment outputs")
     p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-72B-Instruct")
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
     p.add_argument("--load_in_8bit", action="store_true", default=False)
@@ -320,6 +329,8 @@ def parse_args():
     p.add_argument("--wandb_project", type=str, default="decentralized-infer-compression")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_log_every", type=int, default=100, help="Log every N windows")
+
+
 
     return p.parse_args()
 
@@ -386,7 +397,40 @@ def main():
     totals = meter.totals()
     print(f"\nPPL: {ppl:.4f} | time: {t1 - t0:.1f}s")
     print("\n--- Traffic ---")
-    print(meter.summary())
+    print(json.dumps(meter.totals(), indent=2, ensure_ascii=False))
+
+    # ---- write output file (experiment record) ----
+    os.makedirs(args.exp_dir, exist_ok=True)
+
+    # 用时间戳做文件名，避免覆盖
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(args.exp_dir, f"run_{run_id}.json")
+
+    record = {
+        "run_id": run_id,
+        "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "args": {
+            "model_name": args.model_name,
+            "dtype": args.dtype,
+            "load_in_8bit": load8,
+            "load_in_4bit": load4,
+            "compressor": args.compressor,
+            "max_length": args.max_length,
+            "stride": args.stride,
+        },
+        "results": {
+            "ppl": float(ppl),
+            "seconds": float(t1 - t0),
+        },
+        "traffic_totals": totals,     # already float values
+        "traffic_per_link": meter.stats,  # per-boundary dict
+    }
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+
+    print(f"\n[Saved] experiment record -> {out_path}")
+
 
     # final wandb log (optional)
     if wandb_run is not None:
