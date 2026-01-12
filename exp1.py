@@ -136,44 +136,76 @@ class Pipeline:
 # =========================
 def make_default_plan(num_layers: int) -> Tuple[str, List[str], str]:
     """
-    Split transformer layers across 4 nodes almost equally:
-      - node0 hosts embedding + the tail layers (the remainder at the end)
-      - node1, node2, node3 host earlier layers
-      - output stays on node0
-
-    Example behavior (num_layers=80):
-      node1: 0-19, node2: 20-39, node3: 40-59, node0: 60-79
+    4 nodes, almost equal layers.
+      - node0 hosts embedding + its share of layers split into early+late halves
+      - when uneven, extra layers go to node1/2/3 (not node0)
+      - output on node0
     """
-    embed_node, output_node = "node0", "node0"
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be > 0, got {num_layers}")
 
-    n_nodes = 4
-    tail_node = "node0"
-    mid_nodes = ["node1", "node2", "node3"]
+    embed_node = output_node = "node0"
 
-    # Make node0 take the tail "almost-equal" chunk.
-    # We assign the first 3 chunks to node1-3, and the remainder (including any extra) to node0.
-    base = num_layers // n_nodes          # floor chunk size
-    cut1 = base                           # [0, cut1) -> node1
-    cut2 = 2 * base                       # [cut1, cut2) -> node2
-    cut3 = 3 * base                       # [cut2, cut3) -> node3
-    # [cut3, num_layers) -> node0 (tail, includes remainder)
+    base = num_layers // 4
+    rem  = num_layers % 4
 
-    layer_to_node: List[str] = []
-    for i in range(num_layers):
-        if i < cut1:
-            layer_to_node.append(mid_nodes[0])  # node1
+    # node0 gets the base share; extra goes to node1/2/3
+    c0 = base
+    c1 = base + (1 if rem >= 1 else 0)
+    c2 = base + (1 if rem >= 2 else 0)
+    c3 = base + (1 if rem >= 3 else 0)
+
+    e = c0 // 2          # node0 early
+    l = c0 - e           # node0 late
+
+    layer_to_node: List[str] = [""] * num_layers
+    for i in range(e):
+        layer_to_node[i] = "node0"
+    for i in range(num_layers - l, num_layers):
+        layer_to_node[i] = "node0"
+
+    mid = [i for i, v in enumerate(layer_to_node) if not v]
+    k = 0
+    for _ in range(c1):
+        layer_to_node[mid[k]] = "node1"; k += 1
+    for _ in range(c2):
+        layer_to_node[mid[k]] = "node2"; k += 1
+    for _ in range(c3):
+        layer_to_node[mid[k]] = "node3"; k += 1
+
+    return embed_node, layer_to_node, output_node
 
 
 
 def find_boundaries(embed_node: str, layer_to_node: List[str], output_node: str) -> List[Tuple[str, str, str]]:
+    """
+    Return boundary hops as (where, src, dst).
+
+    Boundaries include:
+      - embed -> first layer node (if different)
+      - layer i -> layer i+1 (if node changes)
+      - last layer -> output node (if different)
+      - output node -> embed node (if different), because generation needs output on embed node
+    """
     b: List[Tuple[str, str, str]] = []
+    if not layer_to_node:
+        return b
+
     if embed_node != layer_to_node[0]:
         b.append(("embed", embed_node, layer_to_node[0]))
+
     for i in range(len(layer_to_node) - 1):
         if layer_to_node[i] != layer_to_node[i + 1]:
             b.append((f"layer:{i}", layer_to_node[i], layer_to_node[i + 1]))
+
+    last_where = f"layer:{len(layer_to_node) - 1}"
     if layer_to_node[-1] != output_node:
-        b.append((f"layer:{len(layer_to_node)-1}", layer_to_node[-1], output_node))
+        b.append((last_where, layer_to_node[-1], output_node))
+
+    # extra hop for generation: output must be available back on embed node
+    if output_node != embed_node:
+        b.append(("output", output_node, embed_node))
+
     return b
 
 
@@ -330,45 +362,59 @@ def load_model(model_id_or_path: str, dtype_str: str, load_in_8bit: bool, load_i
 
     return AutoModelForCausalLM.from_pretrained(model_id_or_path, **kwargs)
 
-
-def prepare_local_model(model_name: str, model_path: Optional[str]) -> str:
+def prepare_local_model(model_name: str, model_dir: Optional[str]) -> str:
     """
-    Return the identifier/path to pass to from_pretrained():
+    Ensure the model is available locally under:
+        <model_dir>/<model_name>
 
-    - If model_path is provided:
-        * If model_path exists AND looks like a HF model directory -> use it
-        * Otherwise -> create it (if needed) and download model_name into it, then use it
-    - If model_path is not provided:
-        * Load directly from hub using model_name
+    Returns the local path to pass to from_pretrained().
+
+    Behavior:
+      - model_dir must be provided
+      - target_path = os.path.join(model_dir, model_name)  (keeps org/name layout)
+      - If target_path already looks like a HF model directory -> return target_path
+      - Otherwise download model_name into target_path and return it
     """
-    if not model_path:
-        raise ValueError("Must provide model_path!")
+    if not model_dir:
+        raise ValueError("Must provide model_dir!")
 
-    # If path exists and is a non-empty HF model dir, just use it
-    if os.path.isdir(model_path):
-        # Heuristics: either config.json exists, or there are model weight shards
-        has_config = os.path.isfile(os.path.join(model_path, "config.json"))
-        has_weights = any(
-            os.path.isfile(os.path.join(model_path, fn))
-            for fn in ("model.safetensors", "pytorch_model.bin")
-        )
+    target_path = os.path.join(model_dir, model_name)
+
+    def looks_like_hf_model_dir(path: str) -> bool:
+        if not os.path.isdir(path):
+            return False
+        has_config = os.path.isfile(os.path.join(path, "config.json"))
+        if not has_config:
+            return False
+
+        # Common weight file patterns
+        direct_weights = ("model.safetensors", "pytorch_model.bin")
+        has_weights = any(os.path.isfile(os.path.join(path, fn)) for fn in direct_weights)
+
+        # Sharded weight patterns
+        try:
+            files = os.listdir(path)
+        except OSError:
+            return False
+
         has_shards = any(
-            (fn.startswith("model-") and fn.endswith(".safetensors"))
-            or (fn.startswith("pytorch_model-") and fn.endswith(".bin"))
-            for fn in os.listdir(model_path)
+            (fn.startswith("model-") and fn.endswith(".safetensors")) or
+            (fn.startswith("pytorch_model-") and fn.endswith(".bin"))
+            for fn in files
         )
-        if has_config and (has_weights or has_shards):
-            return True
+        return has_weights or has_shards
 
-    # Otherwise download into model_path (create it if needed)
-    os.makedirs(model_path, exist_ok=True)
+    if looks_like_hf_model_dir(target_path):
+        return target_path
+
+    os.makedirs(target_path, exist_ok=True)
     snapshot_download(
         repo_id=model_name,
-        local_dir=model_path,
+        local_dir=target_path,
         local_dir_use_symlinks=False,
         resume_download=True,
     )
-    return True
+    return target_path
 
 
 # =========================
@@ -382,7 +428,7 @@ def parse_args():
     p.add_argument("--model_name", type=str, default="Qwen/Qwen3-32B")
 
     # local path + download option
-    p.add_argument("--model_path", type=str, default="/datadrive/transformer",
+    p.add_argument("--model_dir", type=str, default="/root/cache/transformers",
                    help="Local directory to store/load the model. If set, tokenizer/model will load from here.")
 
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
@@ -416,7 +462,7 @@ def main():
             name=args.wandb_run_name,
             config={
                 "model_name": args.model_name,
-                "model_path": args.model_path,
+                "model_dir": args.model_dir,
                 "dtype": args.dtype,
                 "load_in_8bit": load8,
                 "load_in_4bit": load4,
@@ -427,11 +473,11 @@ def main():
         )
 
     # Decide hub id vs local path
-    prepare_local_model(args.model_name, args.model_path)
-    print(f"[Model source] {args.model_path}")
+    model_path = model_path = prepare_local_model(args.model_name, args.model_dir)
+    print(f"[Model source] {model_path}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
-    model = load_model(args.model_path, args.dtype, load_in_8bit=load8, load_in_4bit=load4)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    model = load_model(model_path, args.dtype, load_in_8bit=load8, load_in_4bit=load4)
 
     num_layers = len(model.model.layers)
     print(f"Loaded layers: {num_layers}")
@@ -479,7 +525,7 @@ def main():
         "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
         "args": {
             "model_name": args.model_name,
-            "model_path": args.model_path,
+            "model_dir": args.model_dir,
             "dtype": args.dtype,
             "load_in_8bit": load8,
             "load_in_4bit": load4,
