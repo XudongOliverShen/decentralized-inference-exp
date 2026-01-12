@@ -15,6 +15,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tqdm.auto import tqdm
 
+# NEW: local download helper
+from huggingface_hub import snapshot_download
+
 
 # =========================
 # 1) Compressor
@@ -132,15 +135,34 @@ class Pipeline:
 # 4) Partition -> boundaries
 # =========================
 def make_default_plan(num_layers: int) -> Tuple[str, List[str], str]:
-    # embed node0 | 0-19 node1 | 20-39 node2 | 40-59 node3 | 60-79 node0 | output node0
+    """
+    Split transformer layers across 4 nodes almost equally:
+      - node0 hosts embedding + the tail layers (the remainder at the end)
+      - node1, node2, node3 host earlier layers
+      - output stays on node0
+
+    Example behavior (num_layers=80):
+      node1: 0-19, node2: 20-39, node3: 40-59, node0: 60-79
+    """
     embed_node, output_node = "node0", "node0"
-    layer_to_node = []
+
+    n_nodes = 4
+    tail_node = "node0"
+    mid_nodes = ["node1", "node2", "node3"]
+
+    # Make node0 take the tail "almost-equal" chunk.
+    # We assign the first 3 chunks to node1-3, and the remainder (including any extra) to node0.
+    base = num_layers // n_nodes          # floor chunk size
+    cut1 = base                           # [0, cut1) -> node1
+    cut2 = 2 * base                       # [cut1, cut2) -> node2
+    cut3 = 3 * base                       # [cut2, cut3) -> node3
+    # [cut3, num_layers) -> node0 (tail, includes remainder)
+
+    layer_to_node: List[str] = []
     for i in range(num_layers):
-        if i <= 19: layer_to_node.append("node1")
-        elif i <= 39: layer_to_node.append("node2")
-        elif i <= 59: layer_to_node.append("node3")
-        else: layer_to_node.append("node0")
-    return embed_node, layer_to_node, output_node
+        if i < cut1:
+            layer_to_node.append(mid_nodes[0])  # node1
+
 
 
 def find_boundaries(embed_node: str, layer_to_node: List[str], output_node: str) -> List[Tuple[str, str, str]]:
@@ -291,7 +313,7 @@ def _dtype_from_str(s: str) -> torch.dtype:
     return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[s]
 
 
-def load_model(model_name: str, dtype_str: str, load_in_8bit: bool, load_in_4bit: bool):
+def load_model(model_id_or_path: str, dtype_str: str, load_in_8bit: bool, load_in_4bit: bool):
     dtype = _dtype_from_str(dtype_str)
     kwargs = {"device_map": "auto"} if torch.cuda.is_available() else {}
 
@@ -306,7 +328,47 @@ def load_model(model_name: str, dtype_str: str, load_in_8bit: bool, load_in_4bit
     else:
         kwargs["torch_dtype"] = dtype
 
-    return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    return AutoModelForCausalLM.from_pretrained(model_id_or_path, **kwargs)
+
+
+def prepare_local_model(model_name: str, model_path: Optional[str]) -> str:
+    """
+    Return the identifier/path to pass to from_pretrained():
+
+    - If model_path is provided:
+        * If model_path exists AND looks like a HF model directory -> use it
+        * Otherwise -> create it (if needed) and download model_name into it, then use it
+    - If model_path is not provided:
+        * Load directly from hub using model_name
+    """
+    if not model_path:
+        raise ValueError("Must provide model_path!")
+
+    # If path exists and is a non-empty HF model dir, just use it
+    if os.path.isdir(model_path):
+        # Heuristics: either config.json exists, or there are model weight shards
+        has_config = os.path.isfile(os.path.join(model_path, "config.json"))
+        has_weights = any(
+            os.path.isfile(os.path.join(model_path, fn))
+            for fn in ("model.safetensors", "pytorch_model.bin")
+        )
+        has_shards = any(
+            (fn.startswith("model-") and fn.endswith(".safetensors"))
+            or (fn.startswith("pytorch_model-") and fn.endswith(".bin"))
+            for fn in os.listdir(model_path)
+        )
+        if has_config and (has_weights or has_shards):
+            return True
+
+    # Otherwise download into model_path (create it if needed)
+    os.makedirs(model_path, exist_ok=True)
+    snapshot_download(
+        repo_id=model_name,
+        local_dir=model_path,
+        local_dir_use_symlinks=False,
+        resume_download=True,
+    )
+    return True
 
 
 # =========================
@@ -315,7 +377,14 @@ def load_model(model_name: str, dtype_str: str, load_in_8bit: bool, load_in_4bit
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--exp_dir", type=str, default="exp_data", help="Folder to write experiment outputs")
-    p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-72B-Instruct")
+
+    # default: Qwen3-32B
+    p.add_argument("--model_name", type=str, default="Qwen/Qwen3-32B")
+
+    # local path + download option
+    p.add_argument("--model_path", type=str, default="/datadrive/transformer",
+                   help="Local directory to store/load the model. If set, tokenizer/model will load from here.")
+
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
     p.add_argument("--load_in_8bit", action="store_true", default=False)
     p.add_argument("--load_in_4bit", action="store_true", default=False)
@@ -329,8 +398,6 @@ def parse_args():
     p.add_argument("--wandb_project", type=str, default="decentralized-infer-compression")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_log_every", type=int, default=100, help="Log every N windows")
-
-
 
     return p.parse_args()
 
@@ -349,6 +416,7 @@ def main():
             name=args.wandb_run_name,
             config={
                 "model_name": args.model_name,
+                "model_path": args.model_path,
                 "dtype": args.dtype,
                 "load_in_8bit": load8,
                 "load_in_4bit": load4,
@@ -358,18 +426,18 @@ def main():
             },
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    model = load_model(args.model_name, args.dtype, load_in_8bit=load8, load_in_4bit=load4)
+    # Decide hub id vs local path
+    prepare_local_model(args.model_name, args.model_path)
+    print(f"[Model source] {args.model_path}")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
+    model = load_model(args.model_path, args.dtype, load_in_8bit=load8, load_in_4bit=load4)
 
     num_layers = len(model.model.layers)
     print(f"Loaded layers: {num_layers}")
     print(f"Weight quant: {'4bit' if load4 else '8bit' if load8 else 'none'} | dtype={args.dtype}")
 
-    if num_layers == 80:
-        embed_node, layer_to_node, output_node = make_default_plan(num_layers)
-    else:
-        embed_node, output_node = "node0", "node0"
-        layer_to_node = ["node0"] * num_layers
+    embed_node, layer_to_node, output_node = make_default_plan(num_layers)
 
     boundaries = find_boundaries(embed_node, layer_to_node, output_node)
     print(f"Boundaries: {boundaries}")
@@ -411,6 +479,7 @@ def main():
         "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
         "args": {
             "model_name": args.model_name,
+            "model_path": args.model_path,
             "dtype": args.dtype,
             "load_in_8bit": load8,
             "load_in_4bit": load4,
@@ -422,7 +491,7 @@ def main():
             "ppl": float(ppl),
             "seconds": float(t1 - t0),
         },
-        "traffic_totals": totals,     # already float values
+        "traffic_totals": totals,         # already float values
         "traffic_per_link": meter.stats,  # per-boundary dict
     }
 
@@ -430,7 +499,6 @@ def main():
         json.dump(record, f, ensure_ascii=False, indent=2)
 
     print(f"\n[Saved] experiment record -> {out_path}")
-
 
     # final wandb log (optional)
     if wandb_run is not None:
