@@ -269,7 +269,7 @@ def eval_wikitext2_ppl(
     tokenizer,
     meter: Optional[TrafficMeter] = None,
     wandb_run: Optional[Any] = None,
-    max_length: int = 2048,
+    max_length: int = 2048, # 4056?
     stride: int = 512,
     log_every: int = 1,  # log every N windows
 ) -> float:
@@ -281,6 +281,7 @@ def eval_wikitext2_ppl(
     seqlen = ids.size(1)
     nlls = []
     prev_end = 0
+    total_loss_tokens = 0
 
     # progress bar over windows
     steps = list(range(0, seqlen, stride))
@@ -296,12 +297,18 @@ def eval_wikitext2_ppl(
             y[:, :-trg_len] = -100
 
         out = model(input_ids=x, labels=y, use_cache=False)
-        nlls.append(out.loss * trg_len)
+
+        num_valid = (y != -100).sum().item()      # 有效 label 数（shift 前）
+        num_loss_tokens = num_valid - y.size(0)   # shift 后真正算 loss 的 token 数（batch_size=1）
+
+        nlls.append(out.loss * num_loss_tokens)
 
         prev_end = end
 
+        total_loss_tokens += num_loss_tokens
+
         # current ppl estimate
-        cur_ppl = float(torch.exp(torch.stack(nlls).sum() / prev_end).item())
+        cur_ppl = out.loss.item()
 
         # traffic totals (optional)
         traffic = meter.totals() if meter is not None else None
@@ -319,7 +326,7 @@ def eval_wikitext2_ppl(
             log_dict = {
                 "eval/window": step_i,
                 "eval/scored_tokens": prev_end,
-                "eval/ppl_running": cur_ppl,
+                "eval/cur_ppl": cur_ppl,
             }
             if traffic is not None:
                 log_dict.update({
@@ -334,7 +341,7 @@ def eval_wikitext2_ppl(
             break
 
     # final ppl
-    ppl = float(torch.exp(torch.stack(nlls).sum() / prev_end).item())
+    ppl = float(torch.exp(torch.stack(nlls).sum() / total_loss_tokens).item())
     return ppl
 
 
@@ -432,7 +439,7 @@ def parse_args():
                    help="Local directory to store/load the model. If set, tokenizer/model will load from here.")
 
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
-    p.add_argument("--load_in_8bit", action="store_true", default=False)
+    p.add_argument("--load_in_8bit", action="store_true", default=True)
     p.add_argument("--load_in_4bit", action="store_true", default=False)
 
     p.add_argument("--compressor", type=str, default="none", choices=["none", "int8"])
@@ -443,7 +450,7 @@ def parse_args():
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     p.add_argument("--wandb_project", type=str, default="decentralized-infer-compression")
     p.add_argument("--wandb_run_name", type=str, default=None)
-    p.add_argument("--wandb_log_every", type=int, default=100, help="Log every N windows")
+    p.add_argument("--wandb_log_every", type=int, default=25, help="Log every N windows")
 
     return p.parse_args()
 
