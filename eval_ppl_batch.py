@@ -8,8 +8,10 @@ import os
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
+from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -17,6 +19,40 @@ from tqdm.auto import tqdm
 
 # NEW: local download helper
 from huggingface_hub import snapshot_download
+
+
+def format_bytes(n: float, binary: bool = False) -> str:
+    """
+    Format bytes using K/M/G/T suffix.
+    binary=False -> 1K = 1000
+    binary=True  -> 1Ki = 1024
+    """
+    if n < 0:
+        return "-" + format_bytes(-n, binary)
+
+    base = 1024 if binary else 1000
+    suffixes = ["B", "K", "M", "G", "T", "P"] if not binary else ["B", "Ki", "Mi", "Gi", "Ti", "Pi"]
+
+    for suf in suffixes:
+        if n < base:
+            return f"{n:.1f}{suf}" if suf != "B" else f"{int(n)}{suf}"
+        n /= base
+    return f"{n:.1f}{suffixes[-1]}"
+
+
+def format_duration(seconds: float) -> str:
+    # seconds can be float
+    ms = int(round((seconds - int(seconds)) * 1000))
+    total = int(seconds)
+
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+
+    if h > 0:
+        return f"{h:d}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m:d}m {s:02d}s"
+    return f"{s:d}s {ms:03d}ms"
 
 
 # =========================
@@ -263,70 +299,93 @@ def _input_device(model) -> torch.device:
         return next(model.parameters()).device
 
 
+
 @torch.no_grad()
-def eval_wikitext2_ppl(
+def eval_wikitext2_ppl_serial(
     model,
     tokenizer,
     meter: Optional[TrafficMeter] = None,
     wandb_run: Optional[Any] = None,
-    max_length: int = 2048, # 4056?
+    max_length: int = 2048,
     stride: int = 512,
-    log_every: int = 1,  # log every N windows
+    log_every: int = 1,
+    first_k_tokens: int = 0,
 ) -> float:
+    """
+    deprecated
+    Use eval_wikitext2_ppl instead for batch inference
+    """
     model.eval()
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(ds["text"])
     ids = tokenizer(text, return_tensors="pt")["input_ids"].to(_input_device(model))
 
+    if first_k_tokens and first_k_tokens > 0:
+        ids = ids[:, : min(first_k_tokens, ids.size(1))]
+
     seqlen = ids.size(1)
-    nlls = []
     prev_end = 0
+
+    total_nll = 0.0
     total_loss_tokens = 0
 
-    # progress bar over windows
     steps = list(range(0, seqlen, stride))
     pbar = tqdm(steps, desc="wikitext2 ppl", unit="win")
 
     for step_i, begin in enumerate(pbar, start=1):
         end = min(begin + max_length, seqlen)
-        trg_len = end - prev_end
+        trg_len = end - prev_end  # 这一段代码中真正属于当前步要预测的长度
 
         x = ids[:, begin:end]
         y = x.clone()
+        
+        # Mask 掉不属于当前 stride 的部分（即属于 context 的部分）
         if trg_len < y.size(1):
             y[:, :-trg_len] = -100
 
         out = model(input_ids=x, labels=y, use_cache=False)
+        
+        # 1. 找到所有非 -100 的 label 数量
+        # HF 实际用的是 shift_labels = y[:, 1:]
+        num_loss_tokens = (y[:, 1:] != -100).sum().item()
 
-        num_valid = (y != -100).sum().item()      # 有效 label 数（shift 前）
-        num_loss_tokens = num_valid - y.size(0)   # shift 后真正算 loss 的 token 数（batch_size=1）
-
-        nlls.append(out.loss * num_loss_tokens)
+        # 此时 out.loss 是对所有非 -100 位的平均，我们需要还原回 sum
+        # 虽然 HuggingFace 的内部计算稍显复杂，但在滑动窗口下：
+        # 总 NLL = 平均 Loss * 实际参与计算的有效 Token 数
+        window_avg_nll = float(out.loss.item())
+        total_nll += window_avg_nll * num_loss_tokens
+        total_loss_tokens += num_loss_tokens
+        
+        # 计算当前平均指标
+        avg_ppl = math.exp(total_nll / total_loss_tokens)
+        window_ppl = math.exp(window_avg_nll)
 
         prev_end = end
-
-        total_loss_tokens += num_loss_tokens
-
-        # current ppl estimate
-        cur_ppl = out.loss.item()
 
         # traffic totals (optional)
         traffic = meter.totals() if meter is not None else None
 
         # update tqdm postfix
-        postfix = {"ppl": f"{cur_ppl:.3f}"}
+        postfix = {
+            "cur_ppl": f"{window_ppl:.2f}",
+            "avg_ppl": f"{avg_ppl:.2f}",
+        }
         if traffic is not None and not math.isnan(traffic["bytes_per_token"]):
             postfix["B/tok"] = f"{traffic['bytes_per_token']:.1f}"
-            postfix["bytes"] = f"{int(traffic['total_bytes']):,}"
+            postfix["bytes"] = format_bytes(traffic["total_bytes"])
             postfix["tx"] = f"{int(traffic['total_tx']):,}"
         pbar.set_postfix(postfix)
 
         # wandb log (optional)
         if wandb_run is not None and (step_i % log_every == 0):
             log_dict = {
-                "eval/window": step_i,
-                "eval/scored_tokens": prev_end,
-                "eval/cur_ppl": cur_ppl,
+                "eval_window/window": step_i,
+                "eval_window/window_tokens": num_loss_tokens,
+                "eval_window/window_avg_nll": window_avg_nll,
+                "eval_window/window_avg_ppl": window_ppl,
+                "eval_total/total_tokens": total_loss_tokens,
+                "eval_total/total_nll": total_nll,
+                "eval_total/total_avg_ppl": avg_ppl,
             }
             if traffic is not None:
                 log_dict.update({
@@ -335,14 +394,194 @@ def eval_wikitext2_ppl(
                     "traffic/total_tx": traffic["total_tx"],
                     "traffic/bytes_per_token": traffic["bytes_per_token"],
                 })
-            wandb_run.log(log_dict)
+            wandb_run.log(log_dict, step=total_loss_tokens)
 
         if end == seqlen:
             break
 
     # final ppl
-    ppl = float(torch.exp(torch.stack(nlls).sum() / total_loss_tokens).item())
-    return ppl
+    ppl = math.exp(total_nll / total_loss_tokens)
+    return ppl, total_nll, total_loss_tokens
+
+
+@torch.no_grad()
+def eval_wikitext2_ppl(
+    model,
+    tokenizer,
+    meter: Optional["TrafficMeter"] = None,
+    wandb_run: Optional[Any] = None,
+    max_length: int = 2048,
+    stride: int = 512,
+    log_every: int = 1,          # 每 N 个 batch log 一次
+    first_k_tokens: int = 0,
+    batch_windows: int = 1,      # 每个 batch 包含多少个 window
+):
+    """
+    Batch-able WikiText2 perplexity evaluation.
+    - 每个 batch forward 一次
+    - tqdm / wandb 每个 batch 更新一次
+    - wandb 的 step 使用 batch_idx: 0,1,2,...
+
+    Returns:
+      ppl, total_nll, total_loss_tokens
+    """
+    model.eval()
+
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    text = "\n\n".join(ds["text"])
+    ids = tokenizer(text, return_tensors="pt")["input_ids"].to(_input_device(model))
+
+    if first_k_tokens and first_k_tokens > 0:
+        ids = ids[:, : min(first_k_tokens, ids.size(1))]
+
+    seqlen = ids.size(1)
+
+    # 生成窗口列表 (begin, end, trg_len)，保持与 batch=1 完全一致的 trg_len 逻辑
+    begins = list(range(0, seqlen, stride))
+    windows = []
+    prev_end = 0
+    for begin in begins:
+        end = min(begin + max_length, seqlen)
+        trg_len = end - prev_end
+        windows.append((begin, end, trg_len))
+        prev_end = end
+        if end == seqlen:
+            break
+
+    # pad token：没有 pad_token_id 的 tokenizer 用 eos 兜底
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None:
+        pad_id = 0
+
+    total_nll = 0.0
+    total_loss_tokens = 0
+
+    batch_starts = list(range(0, len(windows), batch_windows))
+    pbar = tqdm(batch_starts, desc="wikitext2 ppl", unit="batch")
+
+    for batch_idx, batch_start in enumerate(pbar):
+        batch = windows[batch_start: batch_start + batch_windows]
+        B = len(batch)
+        if B == 0:
+            break
+
+        # pad 到本 batch 最大长度
+        lens = [end - begin for (begin, end, _) in batch]
+        L = max(lens)
+
+        x = torch.full((B, L), pad_id, dtype=ids.dtype, device=ids.device)
+        attn = torch.zeros((B, L), dtype=torch.long, device=ids.device)
+        y = torch.full((B, L), -100, dtype=ids.dtype, device=ids.device)
+
+        # 组装 input / labels
+        for b, (begin, end, trg_len) in enumerate(batch):
+            l = end - begin
+            xb = ids[:, begin:end].squeeze(0)  # [l]
+
+            x[b, :l] = xb
+            attn[b, :l] = 1
+
+            yb = xb.clone()
+            # 只让最后 trg_len tokens 参与 loss
+            yb[:-trg_len] = -100
+            y[b, :l] = yb
+
+        # forward：不传 labels，手动算 per-example NLL（等价 HF shift + ignore_index=-100）
+        out = model(input_ids=x, attention_mask=attn, use_cache=False)
+        logits = out.logits  # [B, L, V]
+
+        shift_logits = logits[:, :-1, :]   # [B, L-1, V]
+        shift_labels = y[:, 1:]            # [B, L-1]
+        valid_mask = (shift_labels != -100)
+
+        shift_logits = logits[:, :-1, :]          # [B, L-1, V]
+        shift_labels = y[:, 1:]                   # [B, L-1]
+
+        V = shift_logits.size(-1)
+        loss_flat = F.cross_entropy(
+            shift_logits.reshape(-1, V).float(),  # fp32 compute
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        )
+        batch_nll = float(loss_flat.sum().item())
+        batch_tok = int((shift_labels != -100).sum().item())
+
+        total_nll += batch_nll
+        total_loss_tokens += batch_tok
+
+        # 每个 batch 更新一次 tqdm / wandb
+        if batch_tok > 0:
+            batch_avg_nll = batch_nll / batch_tok
+            batch_ppl = math.exp(batch_avg_nll)
+        else:
+            batch_avg_nll = float("nan")
+            batch_ppl = float("nan")
+
+        avg_ppl = math.exp(total_nll / total_loss_tokens) if total_loss_tokens > 0 else float("nan")
+
+        traffic = meter.totals() if meter is not None else None
+
+        postfix = {
+            "batch": f"{batch_idx}",
+            "cur_ppl": f"{batch_ppl:.2f}",
+            "avg_ppl": f"{avg_ppl:.2f}",
+        }
+        if traffic is not None and not math.isnan(traffic["bytes_per_token"]):
+            postfix["B/tok"] = f"{traffic['bytes_per_token']:.1f}"
+            postfix["bytes"] = format_bytes(traffic["total_bytes"])
+            postfix["tx"] = f"{int(traffic['total_tx']):,}"
+        pbar.set_postfix(postfix)
+
+        # wandb：每 N 个 batch log 一次
+        if wandb_run is not None and log_every > 0 and ((batch_idx + 1) % log_every == 0):
+            log_dict = {
+                "eval_batch/batch_idx": batch_idx,
+                "eval_batch/batch_tokens": batch_tok,
+                "eval_batch/batch_avg_nll": batch_avg_nll,
+                "eval_batch/batch_ppl": batch_ppl,
+
+                "eval_total/total_tokens": total_loss_tokens,
+                "eval_total/total_nll": total_nll,
+                "eval_total/total_avg_nll": (total_nll / total_loss_tokens) if total_loss_tokens > 0 else float("nan"),
+                "eval_total/total_avg_ppl": avg_ppl,
+            }
+            if traffic is not None:
+                log_dict.update({
+                    "traffic/total_bytes": traffic["total_bytes"],
+                    "traffic/total_tokens": traffic["total_tokens"],
+                    "traffic/total_tx": traffic["total_tx"],
+                    "traffic/bytes_per_token": traffic["bytes_per_token"],
+                })
+
+            # 关键：wandb step 用 batch_idx（0,1,2,3...）
+            wandb_run.log(log_dict, step=batch_idx)
+
+    ppl = math.exp(total_nll / total_loss_tokens) if total_loss_tokens > 0 else float("nan")
+    return ppl, total_nll, total_loss_tokens
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # =========================
@@ -429,7 +668,7 @@ def prepare_local_model(model_name: str, model_dir: Optional[str]) -> str:
 # =========================
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--exp_dir", type=str, default="exp_data", help="Folder to write experiment outputs")
+    p.add_argument("--exp_dir", type=str, default="/root/work/decentralized-inference-exp/exp_results/sanity_runs", help="Folder to write experiment outputs")
 
     # default: Qwen3-32B
     p.add_argument("--model_name", type=str, default="Qwen/Qwen3-32B")
@@ -441,16 +680,20 @@ def parse_args():
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
     p.add_argument("--load_in_8bit", action="store_true", default=True)
     p.add_argument("--load_in_4bit", action="store_true", default=False)
+    p.add_argument("--batch_size", type=int, default=2)
 
     p.add_argument("--compressor", type=str, default="none", choices=["none", "int8"])
     p.add_argument("--max_length", type=int, default=2048)
     p.add_argument("--stride", type=int, default=512)
+    p.add_argument("--first_k_tokens", type=int, default=5000,
+               help="Only evaluate perplexity on the first K tokens of WikiText-2 test. 0 = full length. # tokens of WikiText-2 test is 299078")
+
 
     # wandb
-    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    p.add_argument("--wandb", action="store_true", default=True, help="Enable Weights & Biases logging")
     p.add_argument("--wandb_project", type=str, default="decentralized-infer-compression")
     p.add_argument("--wandb_run_name", type=str, default=None)
-    p.add_argument("--wandb_log_every", type=int, default=25, help="Log every N windows")
+    p.add_argument("--wandb_log_every", type=int, default=10, help="Log every N windows")
 
     return p.parse_args()
 
@@ -476,6 +719,8 @@ def main():
                 "compressor": args.compressor,
                 "max_length": args.max_length,
                 "stride": args.stride,
+                "first_k_tokens": args.first_k_tokens,
+                "batch_size": args.batch_size
             },
         )
 
@@ -503,7 +748,7 @@ def main():
     print(f"\n=== With hooks: {compressor.name} ===")
 
     t0 = time.time()
-    ppl = eval_wikitext2_ppl(
+    ppl, total_nll, total_loss_tokens = eval_wikitext2_ppl(
         model,
         tokenizer,
         meter=meter,
@@ -511,6 +756,8 @@ def main():
         max_length=args.max_length,
         stride=args.stride,
         log_every=args.wandb_log_every,
+        first_k_tokens=args.first_k_tokens, 
+        batch_windows=args.batch_size,
     )
     t1 = time.time()
     remove_hooks(handles)
@@ -528,8 +775,11 @@ def main():
     out_path = os.path.join(args.exp_dir, f"run_{run_id}.json")
 
     record = {
+        "script_name": "eval_ppl_batch.py",
         "run_id": run_id,
         "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "time_run_s": t1 - t0,
+        "time_run_hms": format_duration(t1 - t0),  # readable
         "args": {
             "model_name": args.model_name,
             "model_dir": args.model_dir,
@@ -539,14 +789,20 @@ def main():
             "compressor": args.compressor,
             "max_length": args.max_length,
             "stride": args.stride,
+            "first_k_tokens": args.first_k_tokens,
+            "batch_size": args.batch_size,
         },
         "results": {
-            "ppl": float(ppl),
-            "seconds": float(t1 - t0),
+            "avg_ppl": float(ppl),
+            "total_nll": total_nll,
+            "total_loss_tokens": total_loss_tokens,
         },
         "traffic_totals": totals,         # already float values
         "traffic_per_link": meter.stats,  # per-boundary dict
     }
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
