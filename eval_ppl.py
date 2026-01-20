@@ -362,7 +362,7 @@ def eval_wikitext2_ppl(
 
 def run_ppl_eval(
     *,
-    model_name: str,
+    model_name: str = "Qwen/Qwen3-32B",
     model_dir: str = "/root/cache/transformers/Qwen/Qwen3-32B",
     dtype: str = "fp16",
     load_in_8bit: bool = False,
@@ -395,6 +395,7 @@ def run_ppl_eval(
         wandb_run = _wandb.init(
             project=wandb_project,
             name=wandb_run_name,
+            resume="never",
             config={
                 "model_name": model_name,
                 "model_dir": model_dir,
