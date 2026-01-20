@@ -1,110 +1,142 @@
-This README provides an overview of the **Decentralized Inference Compression Benchmark**. This tool is designed to evaluate the impact of different activation compression methods on model perplexity (PPL) while simulating the network traffic overhead of a partitioned LLM.
+This repository provides a **decentralized / split inference activation compression benchmark**.  
+It uses PyTorch forward hooks to intercept hidden states at partition boundaries, **compress** them, **record simulated traffic bytes**, **decompress**, and then continue the forward pass.  
+Perplexity (PPL) is evaluated on **WikiText-2**, together with traffic statistics (bytes per token).
+
+You can:
+- **Run the eval out of the box** (no code changes required).
+- **Implement your own compressor** and evaluate PPL vs. Bytes/Token using the same pipeline.
 
 ---
 
-# Decentralized Inference Compression Benchmark
+## Environment
 
-This repository contains a framework to simulate "split inference" across multiple nodes. It uses PyTorch forward hooks to intercept hidden states at specific layer boundaries, compresses them, records the simulated "wire" size, decompresses them, and continues the forward pass.
+- **Python**: 3.9+ (recommended)
+- **GPU**: CUDA strongly recommended (CPU works but is very slow)
 
-## 🚀 1. Environment Setup
-
-To run this project, you need Python 3.8+ and a CUDA-capable environment. For 8-bit or 4-bit weight quantization, `bitsandbytes` and `accelerate` are required. It uses `wandb` for logging.
+Install minimal dependencies:
 
 ```bash
-# Install core dependencies
-pip install torch
-pip install transformers datasets tqdm wandb
+python -m pip install -U pip
+python -m pip install torch transformers datasets tqdm huggingface_hub
+python -m pip install wandb
+```
 
-# Install requirements for 4-bit/8-bit loading
-pip install bitsandbytes accelerate
+If you want 8‑bit / 4‑bit loading via `--load_in_8bit` / `--load_in_4bit`:
 
+```bash
+python -m pip install bitsandbytes accelerate
 ```
 
 ---
 
-## 📂 2. Model Management & Performance
+## Quickstart: run eval (use `eval_compressor_none.py`)
 
-The script includes a helper to manage local model storage. On "Glows" machines, reading from datadrive mounts like `/datadrive` is slow. So I do below worflow:
+Use `eval_compressor_none.py` as the canonical example and entrypoint. It runs multiple
+`first_k_tokens` settings by calling `run_ppl_eval(...)` directly.
 
-1. Store large model weights/cache in a persistent but slower directory (e.g., `/datadrive/cache`).
-2. At the start of my session, move the cache folder to high-speed local storage (e.g., `/root/cache/`).
-3. Use the `--model_dir` argument to point to this high-speed location.
+### 1) Prepare a local model directory, then provide its path to the eval
 
----
+`eval_compressor_none.py` calls `run_ppl_eval(model_dir=...)`. You must first **prepare a local
+model directory** (in a path of your choice), then **provide that path** to the eval via `model_dir`.
 
-## 🏃 3. Running the Benchmark
+**Important:** `model_dir` should be a **local directory on disk** that contains the model weights
+and tokenizer files (i.e., a folder you can pass to `AutoTokenizer.from_pretrained(model_dir)` and
+`AutoModelForCausalLM.from_pretrained(model_dir)`).
 
-The main script is `eval_ppl_batch.py`. It evaluates perplexity on **WikiText-2**.
+Example local path:
+- `/root/cache/transformers/Qwen/Qwen3-32B`
 
-### Basic Usage
+If you do not have a local folder yet, you can create one with `huggingface_hub`:
 
 ```bash
-python3 eval_ppl_batch.py \
-    --model_name Qwen/Qwen3-32B \
-    --model_dir /root/cache/transformers \
-    --dtype fp16 \
-    --load_in_8bit \
-    --compressor none \
-    --batch_size 2 \
-    --first_k_tokens 10000
-
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen3-32B', local_dir='/root/cache/transformers/Qwen/Qwen3-32B', local_dir_use_symlinks=False)"
 ```
 
-### Key Arguments
+### 2) Run the baseline (NoneCompressor)
 
-* `--first_k_tokens`: Sets the evaluation length. Full WikiText-2 (~299k tokens) takes about 9 minutes on an L40S.
-* **Quick Test:** `10000`, `20000`, `50000`, or `100000` tokens.
-* **Full Eval:** `0` (uses all tokens).
+```bash
+python eval_compressor_none.py
+```
 
-
-* `--compressor`: Default is none. Implement new compressor to run eval.
-* `--load_in_4bit` or `--load_in_8bit`: Enables weight quantization to fit large models on smaller VRAM. Let's use 8bit for now.
-* `--batch_size`: let's use 2 for now. different batch size leads to small change in perpleixty.
+It will write JSON records under `./results/compressor_none`.
 
 ---
 
-## 🛠️ 4. Implementing New Compression Methods
+## Implementing your own compressor (edit `eval_compressor_none.py`)
 
-You can extend the framework by subclassing the `Compressor` and `Payload` classes. This allows you to test custom algorithms (e.g., FP8, pruning, or non-linear quantization).
+### Compressor interface (what you must implement)
 
-### The Interface
+The interface is defined in `compressor.py`:
+- `Payload(data, meta, nbytes)`:
+  - `data`: anything your `decompress` understands (often a tensor or a tuple).
+  - `meta`: optional metadata for your scheme.
+  - `nbytes`: **simulated traffic bytes** for this transmission (drives Bytes/Token metrics).
+- `Compressor.compress(x: torch.Tensor) -> Payload`
+- `Compressor.decompress(p: Payload, device: torch.device, dtype: torch.dtype) -> torch.Tensor`
 
-To add a new method, implement the `compress` and `decompress` methods:
+Important requirements:
+- **`decompress()` must return a tensor** and should call `.to(device=device, dtype=dtype)` to restore the device/dtype expected by the model.
+- **`Payload.nbytes` is what the traffic meter uses**:
+  - Compute this according to your compression format (e.g., #bits, packing layout).
+  - Approximations are fine as long as they are consistent.
+
+### Minimal template (replace the compressor inside `eval_compressor_none.py`)
+
+To implement your own compressor, copy `eval_compressor_none.py` and edit just two parts:
+- **Define your compressor class** (implements `compress()` / `decompress()`).
+- **Pass an instance** via `compressor=YourCompressor()`.
+
+Minimal template:
 
 ```python
-class YourCustomCompressor(Compressor):
-    name = "custom_name"
+import torch
+from compressor import Compressor, Payload
+from eval_ppl import run_ppl_eval
+
+
+class MyCompressor(Compressor):
+    name = "my_compressor_v1"
 
     def compress(self, x: torch.Tensor) -> Payload:
-        # 1. Apply your compression logic
-        # 2. Calculate the size in bytes for traffic simulation
-        nbytes = x.numel() * 1 # Example: 1 byte per element
-        return Payload(data=compressed_data, meta={"scale": 1.0}, nbytes=nbytes)
+        # Example: cast activations to fp16 as a "compression"
+        y = x.to(torch.float16)
+        nbytes = y.numel() * y.element_size()  # traffic bytes in this toy scheme
+        return Payload(data=y, meta={"orig_dtype": str(x.dtype)}, nbytes=nbytes)
 
     def decompress(self, p: Payload, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        # 1. Recover the tensor
-        # 2. Ensure it returns to the original device and dtype
-        return recovered_tensor.to(device=device, dtype=dtype)
+        # Restore tensor to the requested device and dtype
+        return p.data.to(device=device, dtype=dtype)
 
+
+if __name__ == "__main__":
+    run_ppl_eval(
+        model_name="Qwen/Qwen3-32B",
+        model_dir="/root/cache/transformers/Qwen/Qwen3-32B",
+        dtype="fp16",
+        load_in_8bit=True,
+        compressor=MyCompressor(),     # pass an instance
+        first_k_tokens=10000,
+        batch_windows=2,
+        result_dir="./results",
+        wandb=True,
+        wandb_run_name="MyCompressor_sanity",
+    )
 ```
 
-After implementing, register it in the `make_compressor` factory function.
+Run:
 
----
+```bash
+python eval_compressor_none.py
+```
 
-## 📊 5. Simulation Logic: Partitioning
+## Outputs
 
-The script uses a "Default Plan" to simulate a 4-node cluster:
+- **Console**: live `cur_ppl`, `avg_ppl`, `B/tok`, `bytes`, and `tx` via `tqdm`.
+- **JSON**: files like `./results/run_*.json`, including:
+  - Average PPL
+  - Total NLL and number of loss tokens
+  - Traffic totals
+  - Per‑link traffic stats
+- **Weights & Biases (optional)**:
+  - If `--wandb` is enabled (default `True`), logs batch‑level metrics and final metrics under `--wandb_project`.
 
-1. **Node 0:** Embedding + Early Layers + Late Layers + Output Head.
-2. **Node 1-3:** Middle Layers.
-
-Communication (and thus compression + decompression) is triggered whenever the "node" assignment changes between two layers.
-
----
-
-## 📈 6. Outputs
-
-* **Console:** Real-time PPL and `Bytes/Token` metrics via tqdm.
-* **JSON Record:** A full summary is saved in `--exp_dir` including per-link traffic statistics and total NLL.
-* **WandB:** Provides live curves of window-based PPL vs. total tokens processed.
