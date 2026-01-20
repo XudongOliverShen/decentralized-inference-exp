@@ -78,32 +78,10 @@ class NoneCompressor(Compressor):
     def decompress(self, p: Payload, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return p.data.to(device=device)
 
-
-class Int8SymPerTensor(Compressor):
-    """
-    Naive baseline: symmetric per-tensor int8.
-    TODO: Not verified!
-    """
-    name = "int8_sym_tensor"
-    def compress(self, x: torch.Tensor) -> Payload:
-        maxv = x.abs().amax()
-        scale = (maxv / 127.0).clamp(min=1e-8)
-        q = torch.clamp((x / scale).round(), -127, 127).to(torch.int8)
-        nbytes = q.numel() * q.element_size() + 4  # + fp32 scale
-        return Payload(q, {"scale": float(scale.detach().cpu().item())}, nbytes)
-
-    def decompress(self, p: Payload, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        q: torch.Tensor = p.data
-        x = q.to(device=device, dtype=torch.float32) * p.meta["scale"]
-        return x.to(dtype=dtype)
-
-
 def make_compressor(name: str) -> Compressor:
     name = name.lower()
     if name in ("none", "identity"):
         return NoneCompressor()
-    if name in ("int8", "int8_sym", "int8_sym_tensor"):
-        return Int8SymPerTensor()
     raise ValueError(f"Unknown compressor: {name}")
 
 
@@ -261,10 +239,13 @@ def make_hook(pipeline: Pipeline, key: str):
         else:
             return out
 
-        if hs.dim() >= 2:
-            ntokens = int(hs.shape[0] * hs.shape[1])
+        if hs.dim() == 3:
+            ntokens = int(hs.shape[0] * hs.shape[1])   # B*T
+        elif hs.dim() == 2:
+            ntokens = int(hs.shape[0])                 # T
         else:
             raise ValueError(f"Unrecognized hidden state of shape {hs.shape}, will lead to wrong token count.")
+
         return pack(pipeline.run(hs, key=key, ntokens=ntokens))
     return _hook
 
@@ -682,7 +663,7 @@ def parse_args():
     p.add_argument("--load_in_4bit", action="store_true", default=False)
     p.add_argument("--batch_size", type=int, default=2)
 
-    p.add_argument("--compressor", type=str, default="none", choices=["none", "int8"])
+    p.add_argument("--compressor", type=str, default="none", choices=["none"])
     p.add_argument("--max_length", type=int, default=2048)
     p.add_argument("--stride", type=int, default=512)
     p.add_argument("--first_k_tokens", type=int, default=5000,

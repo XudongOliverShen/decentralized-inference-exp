@@ -3,3 +3,6 @@ exp_results/*
 
 # But do NOT ignore the sanity_runs subfolder
 !exp_results/sanity_runs/
+
+__pycache__
+wandb
