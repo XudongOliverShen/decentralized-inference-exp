@@ -1,1 +1,5 @@
-exp_results
+# Ignore everything inside the exp_results folder
+exp_results/*
+
+# But do NOT ignore the sanity_runs subfolder
+!exp_results/sanity_runs/

@@ -678,7 +678,7 @@ def parse_args():
                    help="Local directory to store/load the model. If set, tokenizer/model will load from here.")
 
     p.add_argument("--dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
-    p.add_argument("--load_in_8bit", action="store_true", default=True)
+    p.add_argument("--load_in_8bit", action="store_true", default=False)
     p.add_argument("--load_in_4bit", action="store_true", default=False)
     p.add_argument("--batch_size", type=int, default=2)
 
