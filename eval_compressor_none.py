@@ -1,8 +1,18 @@
-# compressors/fp16_cast.py
-import gc
-import torch
-from compressor import Compressor, Payload
+"""
+Baseline example: NoneCompressor eval.
 
+Tip: you can run this file from the repo root:
+  python eval_compressor_none.py
+
+If you copy this file under a subdirectory (e.g. `experiment_scripts/`), add the repo root to
+`sys.path` (see `experiment_scripts/20260120_eval_compressor_none_bf16.py` for an example).
+"""
+
+import gc
+
+import torch
+
+from compressor import Compressor, Payload
 from eval_ppl import run_ppl_eval
 
 
@@ -19,7 +29,7 @@ for k in [10000, 20000, 50000, 100000, 0]:
         load_in_8bit = True,
         compressor=NoneCompressor(),
         first_k_tokens=k,
-        result_dir = './results/compressor_none'
+        result_dir = "./results/compressor_none",
     )
     gc.collect()
     if torch.cuda.is_available():

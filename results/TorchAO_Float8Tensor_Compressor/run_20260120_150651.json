@@ -1,0 +1,52 @@
+{
+  "script_name": "eval_ppl.py",
+  "run_id": "20260120_150651",
+  "timestamp_local": "2026-01-20 15:06:51",
+  "time_run_s": 580.9362363815308,
+  "time_run_hms": "9m 40s",
+  "args": {
+    "model_name": "Qwen/Qwen3-32B",
+    "model_dir": "/root/cache/transformers/Qwen/Qwen3-32B",
+    "dtype": "bf16",
+    "load_in_8bit": true,
+    "load_in_4bit": false,
+    "compressor": "none",
+    "max_length": 2048,
+    "stride": 512,
+    "first_k_tokens": 0,
+    "batch_windows": 2
+  },
+  "results": {
+    "avg_ppl": 6.72603255016019,
+    "total_nll": 570036.4112548828,
+    "total_loss_tokens": 299077
+  },
+  "traffic_totals": {
+    "total_bytes": 24429920256.0,
+    "total_tokens": 4767744.0,
+    "total_tx": 1164.0,
+    "bytes_per_token": 5124.0
+  },
+  "traffic_per_link": {
+    "layer:7:node0->node1:none": {
+      "bytes": 6107480064,
+      "tokens": 1191936,
+      "tx": 291
+    },
+    "layer:23:node1->node2:none": {
+      "bytes": 6107480064,
+      "tokens": 1191936,
+      "tx": 291
+    },
+    "layer:39:node2->node3:none": {
+      "bytes": 6107480064,
+      "tokens": 1191936,
+      "tx": 291
+    },
+    "layer:55:node3->node0:none": {
+      "bytes": 6107480064,
+      "tokens": 1191936,
+      "tx": 291
+    }
+  }
+}
