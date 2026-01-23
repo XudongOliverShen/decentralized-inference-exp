@@ -6,3 +6,5 @@ exp_results/*
 
 __pycache__
 wandb
+
+temp_scripts
